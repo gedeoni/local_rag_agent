@@ -2,6 +2,7 @@ import streamlit as st
 import dspy
 from agno.agent import Agent
 from agno.models.ollama import Ollama
+from agno.models.openai import OpenAIChat
 from agno.tools.duckduckgo import DuckDuckGoTools
 
 class QuerySignature(dspy.Signature):
@@ -23,11 +24,20 @@ class QueryOptimizer(dspy.Module):
     def forward(self, original_query, processed_document_info):
         return self.generate_query(original_query=original_query, processed_document_info=processed_document_info)
 
+def _get_model():
+    """Helper to return the correct model instance dynamically."""
+    if getattr(st.session_state, "use_cloud", False) and getattr(st.session_state, "cloud_provider", "") == "OpenAI" and getattr(st.session_state, "cloud_api_key", ""):
+        return OpenAIChat(id=st.session_state.model_version, api_key=st.session_state.cloud_api_key)
+    else:
+        # Avoid crashing if session state holds a fallback model but Ollama is running
+        model_ver = st.session_state.model_version if hasattr(st.session_state, "model_version") and st.session_state.model_version.startswith("deepseek") else "deepseek-r1:7b"
+        return Ollama(id=model_ver)
+
 def get_web_search_agent() -> Agent:
     """Initialize a web search agent."""
     return Agent(
         name="Web Search Agent",
-        model=Ollama(id="llama3.2"),
+        model=_get_model(),
         tools=[DuckDuckGoTools()],
         instructions="""You are a web search expert. Your primary goal is to find and summarize information from the web that directly answers the user's query.
 
@@ -45,11 +55,9 @@ def get_web_search_agent() -> Agent:
 
 def get_rag_agent() -> Agent:
     """Initialize the main RAG agent."""
-    # Note: Requires st.session_state.model_version initialized
-    model_version = st.session_state.model_version if "model_version" in st.session_state else "deepseek-r1:7b"
     return Agent(
-        name="DeepSeek RAG Agent",
-        model=Ollama(id=model_version),
+        name="Dynamic RAG Agent",
+        model=_get_model(),
         instructions="""You are an Intelligent Agent providing accurate answers.
         Focus on provided documents or web results. If context is provided, prioritize it.
         If no context is found for a specific document reference, ask the user to be more specific.

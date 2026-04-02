@@ -12,6 +12,7 @@ from langchain_community.document_loaders import PyPDFLoader, WebBaseLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import LanceDB
 from langchain_core.embeddings import Embeddings
+from langchain_openai import OpenAIEmbeddings
 from agno.knowledge.embedder.ollama import OllamaEmbedder
 
 logger = logging.getLogger(__name__)
@@ -129,7 +130,13 @@ def process_web(url: str) -> List:
 
 def get_or_create_vector_store(db, texts=None):
     """Get existing or create new vector store."""
-    embeddings = OllamaEmbeddings()
+    if getattr(st.session_state, 'use_cloud', False) and getattr(st.session_state, 'cloud_provider', '') == "OpenAI" and getattr(st.session_state, 'cloud_api_key', ''):
+        embeddings = OpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=st.session_state.cloud_api_key)
+        collection_name = "openai_rag_table"
+    else:
+        embeddings = OllamaEmbeddings()
+        collection_name = COLLECTION_NAME
+        
     try:
         if texts:
             # Generate deterministic IDs for chunks to avoid duplicating them upon re-upload
@@ -143,31 +150,31 @@ def get_or_create_vector_store(db, texts=None):
             
             try:
                 # 1. Try to open the existing table and upsert chunks with matching IDs
-                logger.info(f"Adding {len(texts)} documents to existing table '{COLLECTION_NAME}'")
+                logger.info(f"Adding {len(texts)} documents to existing table '{collection_name}'")
                 store = LanceDB(
                     connection=db,
                     embedding=embeddings,
-                    table_name=COLLECTION_NAME
+                    table_name=collection_name
                 )
                 store.add_documents(texts, ids=ids)
                 return store
             except Exception as inner_e:
                 # 2. Table doesn't exist yet, we must initialize it for the first time
-                logger.info(f"Creating new table '{COLLECTION_NAME}' with {len(texts)} documents")
+                logger.info(f"Creating new table '{collection_name}' with {len(texts)} documents")
                 return LanceDB.from_documents(
                     texts,
                     embeddings,
                     connection=db,
-                    table_name=COLLECTION_NAME,
+                    table_name=collection_name,
                     ids=ids
                 )
         else:
             # Try to open existing
-            logger.info(f"Opening existing table '{COLLECTION_NAME}'")
+            logger.info(f"Opening existing table '{collection_name}'")
             return LanceDB(
                 connection=db,
                 embedding=embeddings,
-                table_name=COLLECTION_NAME
+                table_name=collection_name
             )
     except Exception as e:
         if texts:

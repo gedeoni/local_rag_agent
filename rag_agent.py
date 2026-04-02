@@ -36,6 +36,12 @@ def init_session_state():
         st.session_state.similarity_threshold = 0.5
     if 'rag_enabled' not in st.session_state:
         st.session_state.rag_enabled = True
+    if 'use_cloud' not in st.session_state:
+        st.session_state.use_cloud = False
+    if 'cloud_api_key' not in st.session_state:
+        st.session_state.cloud_api_key = ""
+    if 'cloud_provider' not in st.session_state:
+        st.session_state.cloud_provider = "OpenAI"
 
 def render_sidebar():
     """Renders the settings and configuration sidebar."""
@@ -43,13 +49,45 @@ def render_sidebar():
 
     # Model Selection
     st.sidebar.header("📦 Model Selection")
-    st.session_state.model_version = st.sidebar.radio(
-        "Select Model Version",
-        options=["deepseek-r1:1.5b", "deepseek-r1:7b"],
-        index=1,
-        help="Choose based on your hardware capabilities."
-    )
-    st.sidebar.info(f"Using {st.session_state.model_version}. Make sure to run `ollama pull {st.session_state.model_version}`")
+    
+    from utils.system_checks import is_ollama_installed, get_ollama_models
+    
+    ollama_installed = is_ollama_installed()
+    if not ollama_installed:
+        st.sidebar.warning("⚠️ Ollama is not installed. Falling back to Cloud API.")
+        ollama_models = []
+    else:
+        ollama_models = get_ollama_models()
+        if not ollama_models:
+            st.sidebar.warning("⚠️ Ollama is installed but not running or no models pulled. Falling back to Cloud API.")
+
+    st.session_state.use_cloud = False
+
+    if ollama_models:
+        st.session_state.use_cloud = st.sidebar.checkbox("Use Cloud API instead of Ollama", value=False)
+        
+    if not ollama_models or st.session_state.use_cloud:
+        st.session_state.use_cloud = True
+        st.session_state.cloud_provider = st.sidebar.selectbox("Select Cloud Provider", options=["OpenAI"])
+        st.session_state.cloud_api_key = st.sidebar.text_input(f"{st.session_state.cloud_provider} API Key", type="password")
+        if st.session_state.cloud_provider == "OpenAI":
+            st.session_state.model_version = st.sidebar.selectbox("Select Model", options=["gpt-4o-mini", "gpt-4o"])
+            
+        if not st.session_state.cloud_api_key:
+            st.sidebar.info("Please enter your API Key to proceed.")
+    else:
+        # We have local models!
+        idx = 0
+        if "deepseek-r1:7b" in ollama_models:
+            idx = ollama_models.index("deepseek-r1:7b")
+        
+        st.session_state.model_version = st.sidebar.selectbox(
+            "Select Local Model",
+            options=ollama_models,
+            index=idx,
+            help="These are the models currently pulled in your local Ollama."
+        )
+        st.sidebar.info(f"Using **{st.session_state.model_version}** locally.")
 
     # RAG Mode Toggle
     st.sidebar.header("🔍 RAG Configuration")
@@ -92,7 +130,12 @@ def optimize_search_query(prompt: str) -> str:
                 processed_document_info = "Recently processed documents include: " + ", ".join(doc_list) + "."
 
             # Use selected model for rephrasing
-            lm = dspy.LM(f"ollama_chat/{st.session_state.model_version}", api_base="http://localhost:11434")
+            if getattr(st.session_state, "use_cloud", False) and getattr(st.session_state, "cloud_provider", "") == "OpenAI" and getattr(st.session_state, "cloud_api_key", ""):
+                import os
+                os.environ["OPENAI_API_KEY"] = st.session_state.cloud_api_key
+                lm = dspy.LM(f"openai/{st.session_state.model_version}")
+            else:
+                lm = dspy.LM(f"ollama_chat/{st.session_state.model_version}", api_base="http://localhost:11434")
 
             with dspy.context(lm=lm):
                 optimizer = QueryOptimizer()
@@ -209,6 +252,9 @@ def generate_and_parse_response(context: str, prompt: str, docs: list):
             answer = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
         else:
             thinking, answer = None, content
+
+        # Clean any leaked system tags like <additional_information> from the model's output
+        answer = re.sub(r'<additional_information>.*?</additional_information>', '', answer, flags=re.DOTALL).strip()
 
         st.session_state.history.append({"role": "assistant", "content": answer})
 
