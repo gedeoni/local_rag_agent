@@ -3,6 +3,7 @@ import tempfile
 import logging
 from datetime import datetime
 from typing import List
+import hashlib
 
 import bs4
 import lancedb
@@ -125,20 +126,41 @@ def process_web(url: str) -> List:
         st.error(f"🌐 Web processing error: {str(e)}")
         return []
 
+
 def get_or_create_vector_store(db, texts=None):
     """Get existing or create new vector store."""
     embeddings = OllamaEmbeddings()
     try:
         if texts:
-            # Create or Append
-            logger.info(f"Adding {len(texts)} documents to table '{COLLECTION_NAME}'")
-            return LanceDB.from_documents(
-                texts,
-                embeddings,
-                connection=db,
-                table_name=COLLECTION_NAME,
-                mode="append"
-            )
+            # Generate deterministic IDs for chunks to avoid duplicating them upon re-upload
+            ids = []
+            for doc in texts:
+                # Use file name or URL as the root identifier
+                source_identifier = doc.metadata.get("file_name", doc.metadata.get("url", "unknown_source"))
+                # Hash the source and the strict content together
+                content_hash = hashlib.md5(f"{source_identifier}_{doc.page_content}".encode("utf-8")).hexdigest()
+                ids.append(content_hash)
+            
+            try:
+                # 1. Try to open the existing table and upsert chunks with matching IDs
+                logger.info(f"Adding {len(texts)} documents to existing table '{COLLECTION_NAME}'")
+                store = LanceDB(
+                    connection=db,
+                    embedding=embeddings,
+                    table_name=COLLECTION_NAME
+                )
+                store.add_documents(texts, ids=ids)
+                return store
+            except Exception as inner_e:
+                # 2. Table doesn't exist yet, we must initialize it for the first time
+                logger.info(f"Creating new table '{COLLECTION_NAME}' with {len(texts)} documents")
+                return LanceDB.from_documents(
+                    texts,
+                    embeddings,
+                    connection=db,
+                    table_name=COLLECTION_NAME,
+                    ids=ids
+                )
         else:
             # Try to open existing
             logger.info(f"Opening existing table '{COLLECTION_NAME}'")
