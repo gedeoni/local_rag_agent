@@ -183,3 +183,56 @@ def get_or_create_vector_store(db, texts=None):
         else:
             logger.warning(f"Could not open existing table (might not exist yet): {str(e)}. Proceeding without it until documents are added.")
         return None
+
+def register_document(db, source: str, content: str = ""):
+    """Registers a document source in the dedicated metadata registry table along with its raw text."""
+    # Ensure quotes are escaped for DataFusion SQL string
+    safe_source = source.replace("'", "''")
+    try:
+        tables = db.table_names() if hasattr(db, 'table_names') else db.list_tables()
+        if "document_registry" not in tables:
+            db.create_table("document_registry", data=[{"source": source, "content": content}])
+        else:
+            table = db.open_table("document_registry")
+            # Convert filter string for Datafusion
+            df = table.search().where(f"source = '{safe_source}'").to_pandas()
+            if df.empty:
+                # LanceDB handles schema evolution easily, just pass the dict
+                table.add([{"source": source, "content": content}])
+    except Exception as e:
+        logger.warning(f"Failed to register document in metadata table: {e}")
+
+def get_document_texts(db, sources: List[str]) -> str:
+    """Fetches the raw text content for the given list of document sources from the registry."""
+    if not sources:
+        return ""
+    try:
+        tables = db.table_names() if hasattr(db, 'table_names') else db.list_tables()
+        if "document_registry" in tables:
+            table = db.open_table("document_registry")
+            
+            safe_sources = [s.replace("'", "''") for s in sources]
+            in_list = ", ".join(f"'{s}'" for s in safe_sources)
+            filter_str = f"source IN ({in_list})"
+            
+            df = table.search().where(filter_str).to_pandas()
+            if not df.empty and "content" in df.columns:
+                content_list = df["content"].dropna().tolist()
+                return "\n\n".join(content_list)
+    except Exception as e:
+        logger.warning(f"Failed to fetch content from document_registry: {e}")
+    return ""
+
+@st.cache_data
+def get_available_documents(_db) -> List[str]:
+    """Retrieve distinct document names/urls stored in the database registry."""
+    try:
+        tables = _db.table_names() if hasattr(_db, 'table_names') else _db.list_tables()
+        if "document_registry" in tables:
+            table = _db.open_table("document_registry")
+            df = table.to_pandas()
+            if not df.empty and "source" in df.columns:
+                return sorted(list(set(df["source"].tolist())))
+    except Exception as e:
+        logger.warning(f"Failed to fetch available documents from LanceDB registry: {e}")
+    return []

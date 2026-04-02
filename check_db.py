@@ -16,11 +16,15 @@ def main():
         table_names = db.table_names()
 
         if args.clear:
-            if TABLE_NAME in table_names:
-                db.drop_table(TABLE_NAME)
-                print(f"✅ Table '{TABLE_NAME}' has been cleared.")
-            else:
-                print(f"ℹ️ Table '{TABLE_NAME}' does not exist, nothing to clear.")
+            cleared = False
+            for t_name in [TABLE_NAME, "openai_rag_table", "document_registry"]:
+                if t_name in table_names:
+                    db.drop_table(t_name)
+                    print(f"✅ Table '{t_name}' has been cleared.")
+                    cleared = True
+            
+            if not cleared:
+                print("ℹ️ No relevant RAG tables or registries found to clear.")
             return
 
         print(f"Tables found: {table_names}")

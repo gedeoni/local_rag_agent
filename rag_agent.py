@@ -4,7 +4,7 @@ import re
 import dspy
 import streamlit as st
 
-from core.retrieval import get_lancedb_connection, get_or_create_vector_store, process_pdf, process_web
+from core.retrieval import get_lancedb_connection, get_or_create_vector_store, process_pdf, process_web, get_available_documents, register_document, get_document_texts
 from core.agents import QueryOptimizer, get_web_search_agent, get_rag_agent
 from utils.text_processing import clean_reasoning_output
 
@@ -42,6 +42,8 @@ def init_session_state():
         st.session_state.cloud_api_key = ""
     if 'cloud_provider' not in st.session_state:
         st.session_state.cloud_provider = "OpenAI"
+    if 'selected_docs' not in st.session_state:
+        st.session_state.selected_docs = None
 
 def render_sidebar():
     """Renders the settings and configuration sidebar."""
@@ -153,30 +155,62 @@ def _search_vector_store(query: str) -> tuple[str, list]:
     docs = []
     if st.session_state.rag_enabled and not st.session_state.force_web_search and st.session_state.vector_store:
         try:
-            # Threshold-based search
+            search_kwargs = {"k": 5, "score_threshold": st.session_state.similarity_threshold}
+            
+            selected = getattr(st.session_state, 'selected_docs', None)
+            if selected is not None:
+                if len(selected) == 0:
+                    logger.info("Content retrieval bypassed: No documents selected.")
+                    return "", []
+                # Construct LanceDB SQL filter string
+                safe_docs = [d.replace("'", "''") for d in selected]
+                in_list = ", ".join(f"'{d}'" for d in safe_docs)
+                filter_str = f"metadata.file_name IN ({in_list}) OR metadata.url IN ({in_list})"
+                search_kwargs["filter"] = filter_str
+
             retriever = st.session_state.vector_store.as_retriever(
                 search_type="similarity_score_threshold",
-                search_kwargs={"k": 5, "score_threshold": st.session_state.similarity_threshold}
+                search_kwargs=search_kwargs
             )
-            docs = retriever.invoke(query)
+            
+            try:
+                docs = retriever.invoke(query)
+            except Exception as filter_err:
+                logger.warning(f"Native LanceDB filter failed, using python fallback: {filter_err}")
+                search_kwargs.pop("filter", None)
+                search_kwargs["k"] = 30 # Pull broader and filter locally
+                retriever = st.session_state.vector_store.as_retriever(
+                    search_type="similarity_score_threshold",
+                    search_kwargs=search_kwargs
+                )
+                raw_docs = retriever.invoke(query)
+                docs = [d for d in raw_docs if d.metadata.get("file_name") in selected or d.metadata.get("url") in selected][:5]
 
             # Fallback to plain similarity search for broad queries
-            if not docs:
+            if not docs and selected is None:
                 logger.info("No documents found with threshold. Falling back to basic similarity search.")
                 retriever = st.session_state.vector_store.as_retriever(search_kwargs={"k": 3})
                 docs = retriever.invoke(query)
                 
-                # If the fallback retriever still returns nothing, use raw docs as absolute last resort
-                if not docs and 'all_docs_content' in st.session_state:
-                    raw_text = st.session_state.all_docs_content
-                    # max_chars = 15000 # ~3,500 to 4,000 tokens (safe for DeepSeek 7B window)
-                    # if len(raw_text) > max_chars:
-                    #     context += "\n\n...[Content Truncated due to context window limits]..."
-                    context = raw_text
+            # If the fallback retriever (or strict selected filter) still returns nothing, use raw docs text from registry as absolute last resort
+            if not docs:
+                db_conn = get_lancedb_connection()
+                if db_conn is not None:
+                    # Use selected or all available if none selected
+                    target_docs = selected if selected is not None else getattr(st.session_state, 'processed_documents', [])
+                    raw_text = get_document_texts(db_conn, target_docs)
+                    if raw_text:
+                        st.session_state.all_docs_content = raw_text
+                        
+                if 'all_docs_content' in st.session_state and st.session_state.all_docs_content:
+                    # Cap at 8000 chars to avoid exceeding local LLM context window limits
+                    # context = st.session_state.all_docs_content[:8000]
+                    context = st.session_state.all_docs_content
 
             if docs:
                 context = "\n\n".join([d.page_content for d in docs])
                 st.info(f"📊 Found {len(docs)} relevant document chunks.")
+
         except Exception as e:
             st.warning(f"⚠️ Document search issue: {e}")
     return context, docs
@@ -219,22 +253,53 @@ def handle_document_upload(db_conn):
         with st.spinner('Processing PDF...'):
             texts = process_pdf(uploaded_file)
             if texts and db_conn is not None:
+                full_text = "\n\n".join([doc.page_content for doc in texts])
                 st.session_state.vector_store = get_or_create_vector_store(db_conn, texts)
                 st.session_state.processed_documents.append(uploaded_file.name)
+                register_document(db_conn, uploaded_file.name, full_text)
+                
+                # Pre-select newly uploaded doc immediately
+                if st.session_state.selected_docs is not None:
+                    st.session_state.selected_docs.append(uploaded_file.name)
+                else:
+                    st.session_state.selected_docs = [uploaded_file.name]
+                
+                get_available_documents.clear() # Clear cache to fetch latest
                 st.success(f"✅ Added PDF: {uploaded_file.name}")
 
     if web_url and web_url not in st.session_state.processed_documents:
         with st.spinner('Processing URL...'):
             texts = process_web(web_url)
             if texts and db_conn is not None:
+                full_text = "\n\n".join([doc.page_content for doc in texts])
                 st.session_state.vector_store = get_or_create_vector_store(db_conn, texts)
                 st.session_state.processed_documents.append(web_url)
+                register_document(db_conn, web_url, full_text)
+                
+                # Pre-select newly uploaded doc immediately
+                if st.session_state.selected_docs is not None:
+                    st.session_state.selected_docs.append(web_url)
+                else:
+                    st.session_state.selected_docs = [web_url]
+
+                get_available_documents.clear() # Clear cache to fetch latest 
                 st.success(f"✅ Added URL: {web_url}")
 
-    if st.session_state.processed_documents:
-        st.sidebar.header("📚 Processed Sources")
-        for source in st.session_state.processed_documents:
-            st.sidebar.text(f"📄 {source}" if source.endswith('.pdf') else f"🌐 {source}")
+    st.sidebar.header("📚 Context Selection")
+    if db_conn is not None:
+        available_docs = set(get_available_documents(db_conn))
+        available_docs.update(st.session_state.processed_documents)
+        available_docs = sorted(list(available_docs))
+        
+        if available_docs:
+            st.session_state.selected_docs = st.sidebar.multiselect(
+                "Filter RAG Context by Source",
+                options=available_docs,
+                default=available_docs if st.session_state.selected_docs is None else [d for d in st.session_state.selected_docs if d],
+                help="Only text from the selected documents will be used to answer your questions."
+            )
+        else:
+            st.sidebar.info("No documents available in database.")
 
 def generate_and_parse_response(context: str, prompt: str, docs: list):
     """Generates the RAG agent response and updates the UI."""
