@@ -16,16 +16,15 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
-
 from agno.agent import Agent
 from agno.models.ollama import Ollama
 from langchain_community.document_loaders import PyPDFLoader, WebBaseLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import LanceDB
 from langchain_core.embeddings import Embeddings
-from agno.tools.exa import ExaTools
 from agno.tools.duckduckgo import DuckDuckGoTools
 from agno.knowledge.embedder.ollama import OllamaEmbedder
+
 
 
 class OllamaEmbeddings(Embeddings):
@@ -69,8 +68,6 @@ if 'processed_documents' not in st.session_state:
     st.session_state.processed_documents = []
 if 'history' not in st.session_state:
     st.session_state.history = []
-if 'exa_api_key' not in st.session_state:
-    st.session_state.exa_api_key = ""
 if 'use_web_search' not in st.session_state:
     st.session_state.use_web_search = False
 if 'force_web_search' not in st.session_state:
@@ -116,21 +113,6 @@ if st.session_state.rag_enabled:
 
 st.sidebar.header("🌐 Web Search Configuration")
 st.session_state.use_web_search = st.sidebar.checkbox("Enable Web Search Fallback", value=st.session_state.use_web_search)
-
-if st.session_state.use_web_search:
-    st.session_state.exa_api_key = st.sidebar.text_input(
-        "Exa AI API Key", 
-        type="password",
-        value=st.session_state.exa_api_key,
-        help="Optional: Use Exa AI for better results, else DuckDuckGo is used."
-    )
-
-    default_domains = ["arxiv.org", "wikipedia.org", "github.com", "medium.com"]
-    custom_domains = st.sidebar.text_input(
-        "Custom domains (comma-separated)", 
-        value=",".join(default_domains)
-    )
-    search_domains = [d.strip() for d in custom_domains.split(",") if d.strip()]
 
 
 # Utility Functions
@@ -244,29 +226,15 @@ def get_or_create_vector_store(db, texts=None):
 
 def get_web_search_agent() -> Agent:
     """Initialize a web search agent."""
-    web_tools = []
-    tool_name = "DuckDuckGo"
-
-    if st.session_state.exa_api_key:
-        web_tools.append(ExaTools(
-            api_key=st.session_state.exa_api_key,
-            include_domains=search_domains,
-            num_results=5
-        ))
-        tool_name = "Exa AI"
-    else:
-        # Revert to standard initialization to avoid Toolkit argument error
-        web_tools.append(DuckDuckGoTools())
-
     return Agent(
         name="Web Search Agent",
         model=Ollama(id="llama3.2"),
-        tools=web_tools,
-        instructions=f"""You are a web search expert. Your primary goal is to find and summarize information from the web that directly answers the user's query.
+        tools=[DuckDuckGoTools()],
+        instructions="""You are a web search expert. Your primary goal is to find and summarize information from the web that directly answers the user's query.
 
         Follow these steps:
-        1. Use the {tool_name} search tools to gather relevant information.
-        2. FOR DUCKDUCKGO: Prefer 'search' or 'duckduckgo_search' for general facts and data.
+        1. Use the DuckDuckGo search tools to gather relevant information.
+        2. Prefer 'search' or 'duckduckgo_search' for general facts and data.
         3. Extract the most important and factual information pertinent to the user's question.
         4. Synthesize this information into a concise and clear summary or a list of key findings.
         5. Always include the URLs of the sources you used.
