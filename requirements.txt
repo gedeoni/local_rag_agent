@@ -10,3 +10,4 @@ duckduckgo-search
 openai
 ddgs
 lxml
+dspy-ai

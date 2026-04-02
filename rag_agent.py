@@ -1,11 +1,13 @@
 import os
 import tempfile
 import logging
+import re
 from datetime import datetime
 from typing import List, Optional
 import streamlit as st
 import bs4
 import lancedb
+import dspy
 
 # Configure logging
 logging.basicConfig(
@@ -50,6 +52,38 @@ class OllamaEmbeddings(Embeddings):
             raise e
 
 
+# Utility to clean reasoning tags from DeepSeek R1
+def clean_reasoning_output(text: str) -> str:
+    """Removes <think>...</think> tags and returns the actual content."""
+    if not text:
+        return ""
+    clean_text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+    # Also remove any markdown headers that might be added by model
+    clean_text = re.sub(r'^.*?optimized_query:?\s*', '', clean_text, flags=re.IGNORECASE).strip()
+    return clean_text
+
+
+# DSPy Signatures and Modules for Prompt Fine-tuning
+class QuerySignature(dspy.Signature):
+    """Refine and expand the user's query for better document retrieval in a RAG system.
+    If the query contains vague references like 'this document', 'the uploaded file', or 'the content',
+    use the 'processed_document_info' to make the query explicit and specific.
+    Identify key terms, entities, and context to create a more effective search query.
+    Return a single string that will be used for vector search.
+    """
+    original_query = dspy.InputField()
+    processed_document_info = dspy.InputField(desc="Information about recently processed documents that are available for search.")
+    optimized_query = dspy.OutputField(desc="A refined version of the query for search.")
+
+class QueryOptimizer(dspy.Module):
+    def __init__(self):
+        super().__init__()
+        self.generate_query = dspy.ChainOfThought(QuerySignature)
+
+    def forward(self, original_query, processed_document_info):
+        return self.generate_query(original_query=original_query, processed_document_info=processed_document_info)
+
+
 # Constants
 COLLECTION_NAME = "deepseek_rag_table"
 LANCEDB_URI = os.path.abspath("./.lancedb")
@@ -57,11 +91,11 @@ LANCEDB_URI = os.path.abspath("./.lancedb")
 
 # Streamlit App Initialization
 st.set_page_config(page_title="Deepseek Local RAG", layout="wide")
-st.title("🐋 Deepseek Local RAG Reasoning Agent")
+st.title("🐋 Local RAG Reasoning Agent")
 
 # Session State Initialization
 if 'model_version' not in st.session_state:
-    st.session_state.model_version = "deepseek-r1:1.5b"
+    st.session_state.model_version = "deepseek-r1:7b"
 if 'vector_store' not in st.session_state:
     st.session_state.vector_store = None
 if 'processed_documents' not in st.session_state:
@@ -73,7 +107,7 @@ if 'use_web_search' not in st.session_state:
 if 'force_web_search' not in st.session_state:
     st.session_state.force_web_search = False
 if 'similarity_threshold' not in st.session_state:
-    st.session_state.similarity_threshold = 0.7
+    st.session_state.similarity_threshold = 0.5
 if 'rag_enabled' not in st.session_state:
     st.session_state.rag_enabled = True
 
@@ -86,6 +120,7 @@ st.sidebar.header("📦 Model Selection")
 st.session_state.model_version = st.sidebar.radio(
     "Select Model Version",
     options=["deepseek-r1:1.5b", "deepseek-r1:7b"],
+    index=1,
     help="Choose based on your hardware capabilities."
 )
 st.sidebar.info(f"Using {st.session_state.model_version}. Make sure to run `ollama pull {st.session_state.model_version}`")
@@ -107,7 +142,7 @@ if st.session_state.rag_enabled:
         "Document Similarity Threshold",
         min_value=0.0,
         max_value=1.0,
-        value=0.7,
+        value=0.5,
         help="Lower values are more strict."
     )
 
@@ -144,6 +179,9 @@ def process_pdf(file) -> List:
             tmp_file.write(file.getvalue())
             loader = PyPDFLoader(tmp_file.name)
             documents = loader.load()
+
+            all_content = [doc.page_content for doc in documents]
+            st.session_state.all_docs_content = "\n\n".join(all_content)
 
             for doc in documents:
                 doc.metadata.update({
@@ -252,7 +290,9 @@ def get_rag_agent() -> Agent:
         name="DeepSeek RAG Agent",
         model=Ollama(id=st.session_state.model_version),
         instructions="""You are an Intelligent Agent providing accurate answers.
-        Focus on provided documents or web results. Synthesize clearly and cite sources.""",
+        Focus on provided documents or web results. If context is provided, prioritize it.
+        If no context is found for a specific document reference, ask the user to be more specific.
+        Synthesize clearly and cite sources.""",
         # show_tool_calls=True,
         markdown=True,
     )
@@ -309,35 +349,73 @@ if prompt:
     docs = []
 
     with st.spinner("🤖 Processing..."):
-        # 1. Document Search
+        # 1. Query Optimization with DSPy
+        optimized_query = prompt
         if st.session_state.rag_enabled and not st.session_state.force_web_search and st.session_state.vector_store:
             try:
+                # Prepare document info for DSPy
+                processed_document_info = "No documents have been processed recently."
+                if st.session_state.processed_documents:
+                    doc_list = []
+                    for doc_name in st.session_state.processed_documents:
+                        if doc_name.endswith('.pdf'):
+                            doc_list.append(f"a PDF file named '{doc_name}'")
+                        else:
+                            doc_list.append(f"a web page from '{doc_name}'")
+                    processed_document_info = "Recently processed documents include: " + ", ".join(doc_list) + "."
+
+                # Use selected model for rephrasing
+                lm = dspy.LM(f"ollama_chat/{st.session_state.model_version}", api_base="http://localhost:11434")
+
+                with dspy.context(lm=lm):
+                    optimizer = QueryOptimizer()
+                    result = optimizer(original_query=prompt, processed_document_info=processed_document_info)
+                    # Clean the optimized query of reasoning artifacts
+                    optimized_query = clean_reasoning_output(result.optimized_query)
+                    st.info(f"✨ Optimized Search Query: {optimized_query}")
+            except Exception as e:
+                logger.error(f"DSPy optimization failed: {e}")
+                # Fallback to original prompt
+
+        # 2. Document Search
+        if st.session_state.rag_enabled and not st.session_state.force_web_search and st.session_state.vector_store:
+            try:
+                # 2.1 Threshold-based search
                 retriever = st.session_state.vector_store.as_retriever(
                     search_type="similarity_score_threshold",
                     search_kwargs={"k": 5, "score_threshold": st.session_state.similarity_threshold}
                 )
-                docs = retriever.invoke(prompt)
+                docs = retriever.invoke(optimized_query)
+
+                # 2.2 Fallback to plain similarity search for broad queries
+                if not docs:
+                    logger.info("No documents found with threshold. Falling back to basic similarity search.")
+                    retriever = st.session_state.vector_store.as_retriever(search_kwargs={"k": 3})
+                    context = st.session_state.all_docs_content
+
                 if docs:
                     context = "\n\n".join([d.page_content for d in docs])
                     st.info(f"📊 Found {len(docs)} relevant document chunks.")
             except Exception as e:
                 st.warning(f"⚠️ Document search issue: {e}")
 
-        # 2. Web Search Fallback/Force
+        # 3. Web Search Fallback/Force
         if (st.session_state.force_web_search or (st.session_state.rag_enabled and not context)) and st.session_state.use_web_search:
             try:
                 web_agent = get_web_search_agent()
-                web_results = web_agent.run(prompt).content
+                # Also use optimized_query here if available
+                web_results = web_agent.run(optimized_query).content
                 if web_results:
                     context = f"Web Search Results:\n{web_results}"
                     st.info("🌐 Using web search results.")
             except Exception as e:
                 st.error(f"❌ Web search error: {str(e)}")
 
-        # 3. Generate Final Response
+        # 4. Generate Final Response
         try:
             rag_agent = get_rag_agent()
             full_prompt = f"Context: {context}\n\nQuestion: {prompt}" if context else prompt
+            logger.info(f"Final prompt to RAG agent: {full_prompt[:200]}...")
             response = rag_agent.run(full_prompt)
 
             # Handle thinking process for DeepSeek R1
