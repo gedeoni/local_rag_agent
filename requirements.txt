@@ -1,0 +1,12 @@
+agno
+exa_py
+lancedb
+langchain-community==0.3.13
+streamlit==1.41.1
+ollama
+beautifulsoup4
+pypdf
+duckduckgo-search
+openai
+ddgs
+lxml
