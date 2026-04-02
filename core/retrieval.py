@@ -1,0 +1,156 @@
+import os
+import tempfile
+import logging
+from datetime import datetime
+from typing import List
+
+import bs4
+import lancedb
+import streamlit as st
+from langchain_community.document_loaders import PyPDFLoader, WebBaseLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import LanceDB
+from langchain_core.embeddings import Embeddings
+from agno.knowledge.embedder.ollama import OllamaEmbedder
+
+logger = logging.getLogger(__name__)
+
+# Constants
+COLLECTION_NAME = "deepseek_rag_table"
+LANCEDB_URI = os.path.abspath("./.lancedb")
+
+class OllamaEmbeddings(Embeddings):
+    def __init__(self, model_name="nomic-embed-text"):
+        """
+        Initialize the OllamaEmbeddings with a specific model.
+
+        Args:
+            model_name (str): The name of the model to use for embedding.
+        """
+        self.embedder = OllamaEmbedder(id=model_name, dimensions=768)
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        # Log once instead of for every chunk
+        logger.info(f"Generating embeddings for {len(texts)} document chunks.")
+        return [self.embed_query(text, log=False) for text in texts]
+
+    def embed_query(self, text: str, log: bool = True) -> List[float]:
+        try:
+            if log:
+                logger.debug(f"Generating embedding for query: {text[:50]}...")
+            return self.embedder.get_embedding(text)
+        except Exception as e:
+            logger.error(f"Embedding failed: {str(e)}")
+            st.error(f"🔴 Embedding failed: {str(e)}. Make sure ollama is running and model '{self.embedder.id}' is pulled.")
+            raise e
+
+@st.cache_resource
+def get_lancedb_connection():
+    """Initialize and cache LanceDB connection."""
+    try:
+        # Ensure the directory exists
+        if not os.path.exists(LANCEDB_URI):
+            logger.info(f"Creating LanceDB directory: {LANCEDB_URI}")
+            os.makedirs(LANCEDB_URI, exist_ok=True)
+
+        logger.info(f"Connecting to LanceDB at {LANCEDB_URI}")
+        conn = lancedb.connect(LANCEDB_URI)
+        logger.info(f"Successfully connected to LanceDB")
+        return conn
+    except Exception as e:
+        logger.error(f"LanceDB connection failed: {str(e)}", exc_info=True)
+        st.error(f"🔴 LanceDB connection failed: {str(e)}")
+        return None
+
+def process_pdf(file) -> List:
+    """Process PDF file."""
+    try:
+        logger.info(f"Processing PDF: {file.name}")
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+            tmp_file.write(file.getvalue())
+            loader = PyPDFLoader(tmp_file.name)
+            documents = loader.load()
+
+            all_content = [doc.page_content for doc in documents]
+            st.session_state.all_docs_content = "\n\n".join(all_content)
+
+            for doc in documents:
+                doc.metadata.update({
+                    "source_type": "pdf",
+                    "file_name": file.name,
+                    "timestamp": datetime.now().isoformat()
+                })
+
+            text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+            chunks = text_splitter.split_documents(documents)
+            logger.info(f"Split PDF into {len(chunks)} chunks")
+            return chunks
+    except Exception as e:
+        logger.error(f"PDF processing error: {str(e)}")
+        st.error(f"📄 PDF processing error: {str(e)}")
+        return []
+
+def process_web(url: str) -> List:
+    """Process web URL."""
+    try:
+        logger.info(f"Processing URL: {url}")
+        loader = WebBaseLoader(
+            web_paths=(url,),
+            bs_kwargs=dict(
+                parse_only=bs4.SoupStrainer(
+                    class_=("post-content", "post-title", "post-header", "content", "main")
+                )
+            )
+        )
+        documents = loader.load()
+
+        for doc in documents:
+            doc.metadata.update({
+                "source_type": "url",
+                "url": url,
+                "timestamp": datetime.now().isoformat()
+            })
+
+            # Check if all_docs_content exists because maybe no PDF was processed
+            if 'all_docs_content' not in st.session_state:
+                st.session_state.all_docs_content = ""
+            st.session_state.all_docs_content += "\n\n" + "\n\n".join([d.page_content for d in documents])
+
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        chunks = text_splitter.split_documents(documents)
+        logger.info(f"Split web content into {len(chunks)} chunks")
+        return chunks
+    except Exception as e:
+        logger.error(f"Web processing error: {str(e)}")
+        st.error(f"🌐 Web processing error: {str(e)}")
+        return []
+
+def get_or_create_vector_store(db, texts=None):
+    """Get existing or create new vector store."""
+    embeddings = OllamaEmbeddings()
+    try:
+        if texts:
+            # Create or Append
+            logger.info(f"Adding {len(texts)} documents to table '{COLLECTION_NAME}'")
+            return LanceDB.from_documents(
+                texts,
+                embeddings,
+                connection=db,
+                table_name=COLLECTION_NAME,
+                mode="append"
+            )
+        else:
+            # Try to open existing
+            logger.info(f"Opening existing table '{COLLECTION_NAME}'")
+            return LanceDB(
+                connection=db,
+                embedding=embeddings,
+                table_name=COLLECTION_NAME
+            )
+    except Exception as e:
+        if texts:
+            logger.error(f"Vector store creation error: {str(e)}")
+            st.error(f"🔴 Vector store creation error: {str(e)}")
+        else:
+            logger.warning(f"Could not open existing table (might not exist yet): {str(e)}. Proceeding without it until documents are added.")
+        return None
