@@ -236,3 +236,71 @@ def get_available_documents(_db) -> List[str]:
     except Exception as e:
         logger.warning(f"Failed to fetch available documents from LanceDB registry: {e}")
     return []
+
+def execute_retrieval_pipeline(vector_store, query: str, threshold: float, selected_docs: List[str] | None, db_conn) -> tuple[str, list]:
+    context = ""
+    docs = []
+    
+    if not vector_store:
+        return context, docs
+        
+    try:
+        search_kwargs = {"k": 5, "score_threshold": threshold}
+        
+        if selected_docs is not None:
+            if len(selected_docs) == 0:
+                logger.info("Content retrieval bypassed: No documents selected.")
+                return "", []
+            # Construct LanceDB SQL filter string
+            safe_docs = [d.replace("'", "''") for d in selected_docs]
+            in_list = ", ".join(f"'{d}'" for d in safe_docs)
+            filter_str = f"metadata.file_name IN ({in_list}) OR metadata.url IN ({in_list})"
+            search_kwargs["filter"] = filter_str
+
+        retriever = vector_store.as_retriever(
+            search_type="similarity_score_threshold",
+            search_kwargs=search_kwargs
+        )
+        
+        try:
+            docs = retriever.invoke(query)
+        except Exception as filter_err:
+            logger.warning(f"Native LanceDB filter failed, using python fallback: {filter_err}")
+            search_kwargs.pop("filter", None)
+            search_kwargs["k"] = 30 # Pull broader and filter locally
+            retriever = vector_store.as_retriever(
+                search_type="similarity_score_threshold",
+                search_kwargs=search_kwargs
+            )
+            raw_docs = retriever.invoke(query)
+            docs = [d for d in raw_docs if d.metadata.get("file_name") in selected_docs or d.metadata.get("url") in selected_docs][:5]
+
+        # Fallback to plain similarity search for broad queries
+        if not docs and selected_docs is None:
+            logger.info("No documents found with threshold. Falling back to basic similarity search.")
+            retriever = vector_store.as_retriever(search_kwargs={"k": 3})
+            docs = retriever.invoke(query)
+            
+        # If the fallback retriever (or strict selected filter) still returns nothing, use raw docs text from registry as absolute last resort
+        if not docs:
+            if db_conn is not None:
+                # Use selected or all available if none selected
+                target_docs = selected_docs if selected_docs is not None else getattr(st.session_state, 'processed_documents', [])
+                raw_text = get_document_texts(db_conn, target_docs)
+                if raw_text:
+                    st.session_state.all_docs_content = raw_text
+                    
+            if 'all_docs_content' in st.session_state and st.session_state.all_docs_content:
+                # context = st.session_state.all_docs_content[:8000]
+                context = st.session_state.all_docs_content
+
+        if docs:
+            context = "\n\n".join([d.page_content for d in docs])
+            logger.info(f"Found {len(docs)} relevant document chunks.")
+
+    except Exception as e:
+        logger.warning(f"Document search issue: {e}")
+        st.warning(f"⚠️ Document search issue: {e}")
+        
+    return context, docs
+

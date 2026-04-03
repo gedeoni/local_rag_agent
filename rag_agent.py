@@ -4,9 +4,9 @@ import re
 import dspy
 import streamlit as st
 
-from core.retrieval import get_lancedb_connection, get_or_create_vector_store, process_pdf, process_web, get_available_documents, register_document, get_document_texts
+from core.retrieval import get_lancedb_connection, get_or_create_vector_store, process_pdf, process_web, get_available_documents, register_document, get_document_texts, execute_retrieval_pipeline
 from core.agents import QueryOptimizer, get_web_search_agent, get_rag_agent
-from utils.text_processing import clean_reasoning_output
+from utils.text_processing import clean_reasoning_output, parse_model_response
 from utils.system_checks import is_ollama_installed, get_ollama_models
 
 # Configure logging
@@ -21,36 +21,31 @@ logger = logging.getLogger(__name__)
 
 def init_session_state():
     """Initializes necessary Streamlit session state variables."""
-    if 'model_version' not in st.session_state:
-        st.session_state.model_version = "deepseek-r1:7b"
-    if 'vector_store' not in st.session_state:
-        st.session_state.vector_store = None
-    if 'processed_documents' not in st.session_state:
-        st.session_state.processed_documents = []
-    if 'history' not in st.session_state:
-        st.session_state.history = []
-    if 'use_web_search' not in st.session_state:
-        st.session_state.use_web_search = False
-    if 'force_web_search' not in st.session_state:
-        st.session_state.force_web_search = False
-    if 'similarity_threshold' not in st.session_state:
-        st.session_state.similarity_threshold = 0.5
-    if 'rag_enabled' not in st.session_state:
-        st.session_state.rag_enabled = True
-    if 'use_cloud' not in st.session_state:
-        st.session_state.use_cloud = False
-    if 'cloud_api_key' not in st.session_state:
-        st.session_state.cloud_api_key = ""
-    if 'cloud_provider' not in st.session_state:
-        st.session_state.cloud_provider = "OpenAI"
-    if 'selected_docs' not in st.session_state:
-        st.session_state.selected_docs = None
+    defaults = {
+        'model_version': "deepseek-r1:7b",
+        'vector_store': None,
+        'processed_documents': [],
+        'history': [],
+        'use_web_search': False,
+        'force_web_search': False,
+        'similarity_threshold': 0.5,
+        'rag_enabled': True,
+        'use_cloud': False,
+        'cloud_api_key': "",
+        'cloud_provider': "OpenAI",
+        'selected_docs': None
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
-def render_sidebar():
-    """Renders the settings and configuration sidebar."""
-    st.sidebar.header("🤖 Agent Configuration")
+def should_use_vector_search() -> bool:
+    return st.session_state.rag_enabled and not st.session_state.force_web_search and st.session_state.vector_store is not None
 
-    # Model Selection
+def should_use_web_fallback(current_context: str) -> bool:
+    return (st.session_state.force_web_search or (st.session_state.rag_enabled and not current_context)) and st.session_state.use_web_search
+
+def render_model_settings():
     st.sidebar.header("📦 Model Selection")
     
     ollama_installed = is_ollama_installed()
@@ -86,7 +81,7 @@ def render_sidebar():
         )
         st.sidebar.info(f"Using **{st.session_state.model_version}** locally.")
 
-    # RAG Mode Toggle
+def render_rag_settings():
     st.sidebar.header("🔍 RAG Configuration")
     st.session_state.rag_enabled = st.sidebar.toggle("Enable RAG Mode", value=st.session_state.rag_enabled)
 
@@ -107,13 +102,21 @@ def render_sidebar():
             help="Lower values are more strict."
         )
 
+def render_web_settings():
     st.sidebar.header("🌐 Web Search Configuration")
     st.session_state.use_web_search = st.sidebar.checkbox("Enable Web Search Fallback", value=st.session_state.use_web_search)
+
+def render_sidebar():
+    """Renders the settings and configuration sidebar."""
+    st.sidebar.header("🤖 Agent Configuration")
+    render_model_settings()
+    render_rag_settings()
+    render_web_settings()
 
 def optimize_search_query(prompt: str) -> str:
     """Optimizes search query using DSPy."""
     optimized_query = prompt
-    if st.session_state.rag_enabled and not st.session_state.force_web_search and st.session_state.vector_store:
+    if should_use_vector_search():
         try:
             # Prepare document info for DSPy
             processed_document_info = "No documents have been processed recently."
@@ -145,74 +148,17 @@ def optimize_search_query(prompt: str) -> str:
 
 def _search_vector_store(query: str) -> tuple[str, list]:
     """Helper function to run vector store retrieval."""
-    context = ""
-    docs = []
-    if st.session_state.rag_enabled and not st.session_state.force_web_search and st.session_state.vector_store:
-        try:
-            search_kwargs = {"k": 5, "score_threshold": st.session_state.similarity_threshold}
-            
-            selected = getattr(st.session_state, 'selected_docs', None)
-            if selected is not None:
-                if len(selected) == 0:
-                    logger.info("Content retrieval bypassed: No documents selected.")
-                    return "", []
-                # Construct LanceDB SQL filter string
-                safe_docs = [d.replace("'", "''") for d in selected]
-                in_list = ", ".join(f"'{d}'" for d in safe_docs)
-                filter_str = f"metadata.file_name IN ({in_list}) OR metadata.url IN ({in_list})"
-                search_kwargs["filter"] = filter_str
-
-            retriever = st.session_state.vector_store.as_retriever(
-                search_type="similarity_score_threshold",
-                search_kwargs=search_kwargs
-            )
-            
-            try:
-                docs = retriever.invoke(query)
-            except Exception as filter_err:
-                logger.warning(f"Native LanceDB filter failed, using python fallback: {filter_err}")
-                search_kwargs.pop("filter", None)
-                search_kwargs["k"] = 30 # Pull broader and filter locally
-                retriever = st.session_state.vector_store.as_retriever(
-                    search_type="similarity_score_threshold",
-                    search_kwargs=search_kwargs
-                )
-                raw_docs = retriever.invoke(query)
-                docs = [d for d in raw_docs if d.metadata.get("file_name") in selected or d.metadata.get("url") in selected][:5]
-
-            # Fallback to plain similarity search for broad queries
-            if not docs and selected is None:
-                logger.info("No documents found with threshold. Falling back to basic similarity search.")
-                retriever = st.session_state.vector_store.as_retriever(search_kwargs={"k": 3})
-                docs = retriever.invoke(query)
-                
-            # If the fallback retriever (or strict selected filter) still returns nothing, use raw docs text from registry as absolute last resort
-            if not docs:
-                db_conn = get_lancedb_connection()
-                if db_conn is not None:
-                    # Use selected or all available if none selected
-                    target_docs = selected if selected is not None else getattr(st.session_state, 'processed_documents', [])
-                    raw_text = get_document_texts(db_conn, target_docs)
-                    if raw_text:
-                        st.session_state.all_docs_content = raw_text
-                        
-                if 'all_docs_content' in st.session_state and st.session_state.all_docs_content:
-                    # Cap at 8000 chars to avoid exceeding local LLM context window limits
-                    # context = st.session_state.all_docs_content[:8000]
-                    context = st.session_state.all_docs_content
-
-            if docs:
-                context = "\n\n".join([d.page_content for d in docs])
-                st.info(f"📊 Found {len(docs)} relevant document chunks.")
-
-        except Exception as e:
-            st.warning(f"⚠️ Document search issue: {e}")
-    return context, docs
+    if should_use_vector_search():
+        selected = getattr(st.session_state, 'selected_docs', None)
+        threshold = st.session_state.similarity_threshold
+        db_conn = get_lancedb_connection()
+        return execute_retrieval_pipeline(st.session_state.vector_store, query, threshold, selected, db_conn)
+    return "", []
 
 def _search_web_fallback(query: str, current_context: str) -> str:
     """Helper function to run web fallback if required."""
     context = current_context
-    if (st.session_state.force_web_search or (st.session_state.rag_enabled and not context)) and st.session_state.use_web_search:
+    if should_use_web_fallback(current_context):
         try:
             web_agent = get_web_search_agent()
             web_results = web_agent.run(query).content
@@ -233,6 +179,23 @@ def retrieve_agent_context(query: str) -> tuple[str, list]:
 
     return context, docs
 
+def _process_and_register_source(db_conn, source_id: str, texts: list):
+    """A generic helper to update state, vector store, and DB after processing text."""
+    if texts and db_conn is not None:
+        full_text = "\n\n".join([doc.page_content for doc in texts])
+        st.session_state.vector_store = get_or_create_vector_store(db_conn, texts)
+        st.session_state.processed_documents.append(source_id)
+        register_document(db_conn, source_id, full_text)
+        
+        if st.session_state.selected_docs is not None:
+            st.session_state.selected_docs.append(source_id)
+        else:
+            st.session_state.selected_docs = [source_id]
+        
+        get_available_documents.clear()
+        return True
+    return False
+
 def handle_document_upload(db_conn):
     """Handles the sidebar logic for document uploads."""
     st.sidebar.header("📁 Data Upload")
@@ -246,37 +209,13 @@ def handle_document_upload(db_conn):
     if uploaded_file and uploaded_file.name not in st.session_state.processed_documents:
         with st.spinner('Processing PDF...'):
             texts = process_pdf(uploaded_file)
-            if texts and db_conn is not None:
-                full_text = "\n\n".join([doc.page_content for doc in texts])
-                st.session_state.vector_store = get_or_create_vector_store(db_conn, texts)
-                st.session_state.processed_documents.append(uploaded_file.name)
-                register_document(db_conn, uploaded_file.name, full_text)
-                
-                # Pre-select newly uploaded doc immediately
-                if st.session_state.selected_docs is not None:
-                    st.session_state.selected_docs.append(uploaded_file.name)
-                else:
-                    st.session_state.selected_docs = [uploaded_file.name]
-                
-                get_available_documents.clear() # Clear cache to fetch latest
+            if _process_and_register_source(db_conn, uploaded_file.name, texts):
                 st.success(f"✅ Added PDF: {uploaded_file.name}")
 
     if web_url and web_url not in st.session_state.processed_documents:
         with st.spinner('Processing URL...'):
             texts = process_web(web_url)
-            if texts and db_conn is not None:
-                full_text = "\n\n".join([doc.page_content for doc in texts])
-                st.session_state.vector_store = get_or_create_vector_store(db_conn, texts)
-                st.session_state.processed_documents.append(web_url)
-                register_document(db_conn, web_url, full_text)
-                
-                # Pre-select newly uploaded doc immediately
-                if st.session_state.selected_docs is not None:
-                    st.session_state.selected_docs.append(web_url)
-                else:
-                    st.session_state.selected_docs = [web_url]
-
-                get_available_documents.clear() # Clear cache to fetch latest 
+            if _process_and_register_source(db_conn, web_url, texts):
                 st.success(f"✅ Added URL: {web_url}")
 
     st.sidebar.header("📚 Context Selection")
@@ -303,17 +242,7 @@ def generate_and_parse_response(context: str, prompt: str, docs: list):
         logger.info(f"Final prompt to RAG agent: {full_prompt[:200]}...")
         response = rag_agent.run(full_prompt)
 
-        # Handle thinking process for DeepSeek R1
-        content = response.content
-        think_match = re.search(r'<think>(.*?)</think>', content, re.DOTALL)
-        if think_match:
-            thinking = think_match.group(1).strip()
-            answer = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
-        else:
-            thinking, answer = None, content
-
-        # Clean any leaked system tags like <additional_information> from the model's output
-        answer = re.sub(r'<additional_information>.*?</additional_information>', '', answer, flags=re.DOTALL).strip()
+        thinking, answer = parse_model_response(response.content)
 
         st.session_state.history.append({"role": "assistant", "content": answer})
 
