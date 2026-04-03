@@ -7,6 +7,7 @@ import streamlit as st
 from core.retrieval import get_lancedb_connection, get_or_create_vector_store, process_pdf, process_web, get_available_documents, register_document, get_document_texts
 from core.agents import QueryOptimizer, get_web_search_agent, get_rag_agent
 from utils.text_processing import clean_reasoning_output
+from utils.system_checks import is_ollama_installed, get_ollama_models
 
 # Configure logging
 logging.basicConfig(
@@ -52,8 +53,6 @@ def render_sidebar():
     # Model Selection
     st.sidebar.header("📦 Model Selection")
     
-    from utils.system_checks import is_ollama_installed, get_ollama_models
-    
     ollama_installed = is_ollama_installed()
     if not ollama_installed:
         st.sidebar.warning("⚠️ Ollama is not installed. Falling back to Cloud API.")
@@ -79,14 +78,10 @@ def render_sidebar():
             st.sidebar.info("Please enter your API Key to proceed.")
     else:
         # We have local models!
-        idx = 0
-        if "deepseek-r1:7b" in ollama_models:
-            idx = ollama_models.index("deepseek-r1:7b")
-        
         st.session_state.model_version = st.sidebar.selectbox(
             "Select Local Model",
             options=ollama_models,
-            index=idx,
+            index=0,
             help="These are the models currently pulled in your local Ollama."
         )
         st.sidebar.info(f"Using **{st.session_state.model_version}** locally.")
@@ -133,7 +128,6 @@ def optimize_search_query(prompt: str) -> str:
 
             # Use selected model for rephrasing
             if getattr(st.session_state, "use_cloud", False) and getattr(st.session_state, "cloud_provider", "") == "OpenAI" and getattr(st.session_state, "cloud_api_key", ""):
-                import os
                 os.environ["OPENAI_API_KEY"] = st.session_state.cloud_api_key
                 lm = dspy.LM(f"openai/{st.session_state.model_version}")
             else:
