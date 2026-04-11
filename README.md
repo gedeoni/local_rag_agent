@@ -14,7 +14,7 @@ A highly capable, privacy-focused, and dynamic Retrieval-Augmented Generation (R
 
 ## 🏗️ Architecture Overview
 
-The codebase has been refactored for strict separation of concerns across a clean directory structure:
+The codebase designed with strict separation of concerns across a clean directory structure in mind:
 
 1. **`rag_agent.py`**: The Streamlit Orchestrator. Handles UI logic, application state, configuring the sidebar, and processing the chat execution loop.
 2. **`core/retrieval.py`**: The Database & Vector pipeline. Manages LanceDB instances, parses PDFs/Web URLs via Langchain loaders, embeds documents using Ollama/Cloud embeddings, and exposes the unified robust retrieval pipeline.
