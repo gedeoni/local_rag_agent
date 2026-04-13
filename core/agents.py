@@ -13,7 +13,8 @@ import shutil
 
 logger = logging.getLogger(__name__)
 
-MEMPALACE_DIR = "/Users/gedeon/Projects/AI/mempalace"
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MEMPALACE_DIR = os.path.join(PROJECT_ROOT, "mempalace")
 
 
 def _find_uv() -> str | None:
@@ -163,8 +164,9 @@ async def _get_rag_agent_async(mcp_tools: MCPTools | None, cfg: dict) -> Agent:
         Focus on provided documents or web results. If context is provided, prioritize it.
         If no context is found for a specific document reference, ask the user to be more specific.
         You have access to MemPalace, a memory system, through your tools.
-        IMPORTANT: At the start of EVERY session call mempalace_status first to load the memory protocol.
-        Use mempalace_search to retrieve context about past decisions before answering.
+        Use 'mempalace_search' for semantic memory or 'mempalace_kg_query' for facts ONLY when the query relates to personal context, past conversations, or your knowledge graph.
+        IMPORTANT: ALWAYS use the exact parameter names defined in the tool schema (e.g., use 'query' NOT 'q').
+        For general knowledge questions, provide a direct answer without searching your memory unless you need to verify a specific personal fact.
         Synthesize clearly and cite sources.""",
         markdown=True,
     )
@@ -242,6 +244,12 @@ async def _get_memory_agent_async(mcp_tools: MCPTools | None, cfg: dict) -> Agen
         instructions="""You are a Memory Supervisor. Your ONLY job is to save factoids, insights, and summaries into MemPalace.
         You will receive the latest interaction between the User and the Assistant.
         If there are any new facts, decisions, context, or conclusions reached, you MUST call 'mempalace_diary_write' to save them.
+        IMPORTANT: ALWAYS use the exact parameter names defined in the tool schema (e.g., use 'entry' NOT 'q').
+        When calling 'mempalace_diary_write', you MUST use these exact parameters:
+        - agent_name: Set this to 'RAG_Agent'.
+        - entry: Your summary or factoid in AAAK format.
+        - topic: A relevant topic category (optional).
+        Do NOT use a 'q' or 'query' parameter.
         Do NOT reply with a chat message. Just use the tool. If nothing is worth saving, simply return nothing.""",
         markdown=True,
     )

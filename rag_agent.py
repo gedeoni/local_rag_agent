@@ -166,19 +166,19 @@ def _is_general_query(prompt: str) -> bool:
     """
     lower = prompt.lower().strip()
 
-    # Contains a vague document reference → needs optimization
-    if any(ref in lower for ref in _VAGUE_DOC_REFS):
-        return False
-
-    # Starts with a command/tool verb → general instruction, skip
+    # 1. Starts with a command/tool verb → general instruction, skip
     if any(lower.startswith(p) for p in _GENERAL_PREFIXES):
         return True
 
-    # Mentions specific tool names → skip
+    # 2. Mentions specific tool names → skip
     if any(kw in lower for kw in _TOOL_KEYWORDS):
         return True
 
-    return False
+    # 3. Contains a vague document reference → needs optimization
+    if any(ref in lower for ref in _VAGUE_DOC_REFS):
+        return False
+
+    return True
 
 
 def optimize_search_query(prompt: str, cfg: dict | None = None) -> tuple[str, str | None]:
@@ -199,13 +199,15 @@ def optimize_search_query(prompt: str, cfg: dict | None = None) -> tuple[str, st
             # Use selected_docs as the source of truth — only inform the LLM
             # about the documents the user has actually chosen to query against.
             if cfg is not None:
-                active_docs = cfg.get('selected_docs') or cfg.get('processed_documents', [])
+                selected = cfg.get('selected_docs')
+                active_docs = selected if selected is not None else cfg.get('processed_documents', [])
                 use_cloud = cfg.get('use_cloud', False)
                 cloud_provider = cfg.get('cloud_provider', '')
                 cloud_api_key = cfg.get('cloud_api_key', '')
                 model_version = cfg.get('model_version', 'llama3.2:latest')
             else:
-                active_docs = getattr(st.session_state, 'selected_docs', None) or st.session_state.processed_documents
+                selected = getattr(st.session_state, 'selected_docs', None)
+                active_docs = selected if selected is not None else getattr(st.session_state, 'processed_documents', [])
                 use_cloud = getattr(st.session_state, "use_cloud", False)
                 cloud_provider = getattr(st.session_state, "cloud_provider", "")
                 cloud_api_key = getattr(st.session_state, "cloud_api_key", "")
