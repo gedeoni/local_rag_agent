@@ -250,7 +250,7 @@ def _search_vector_store(query: str, cfg: dict | None = None) -> tuple[str, list
             threshold = st.session_state.similarity_threshold
             vector_store = st.session_state.vector_store
         db_conn = get_lancedb_connection()
-        return execute_retrieval_pipeline(vector_store, query, threshold, selected, db_conn)
+        return execute_retrieval_pipeline(vector_store, query, threshold, selected, db_conn, cfg)
     return "", []
 
 def _search_web_fallback(query: str, current_context: str, cfg: dict | None = None) -> str:
@@ -260,7 +260,8 @@ def _search_web_fallback(query: str, current_context: str, cfg: dict | None = No
     context = current_context
     if should_use_web_fallback(current_context, cfg):
         try:
-            web_agent = get_web_search_agent()
+            agent_cfg = cfg if cfg is not None else _snapshot_session_state()
+            web_agent = get_web_search_agent(agent_cfg)
             web_results = web_agent.run(query).content
             if web_results:
                 context = f"Web Search Results:\n{web_results}"
@@ -287,7 +288,12 @@ def _process_and_register_source(db_conn, source_id: str, texts: list):
     """A generic helper to update state, vector store, and DB after processing text."""
     if texts and db_conn is not None:
         full_text = "\n\n".join([doc.page_content for doc in texts])
-        st.session_state.vector_store = get_or_create_vector_store(db_conn, texts)
+        st.session_state.vector_store = get_or_create_vector_store(
+            db_conn, texts,
+            use_cloud=st.session_state.get('use_cloud', False),
+            cloud_provider=st.session_state.get('cloud_provider', ''),
+            cloud_api_key=st.session_state.get('cloud_api_key', '')
+        )
         st.session_state.processed_documents.append(source_id)
         register_document(db_conn, source_id, full_text)
         
@@ -308,7 +314,12 @@ def handle_document_upload(db_conn):
 
     # Initialize vector store from existing DB if not yet in session
     if db_conn is not None and st.session_state.vector_store is None:
-        st.session_state.vector_store = get_or_create_vector_store(db_conn)
+        st.session_state.vector_store = get_or_create_vector_store(
+            db_conn,
+            use_cloud=st.session_state.get('use_cloud', False),
+            cloud_provider=st.session_state.get('cloud_provider', ''),
+            cloud_api_key=st.session_state.get('cloud_api_key', '')
+        )
 
     if uploaded_file and uploaded_file.name not in st.session_state.processed_documents:
         with st.spinner('Processing PDF...'):
@@ -340,7 +351,7 @@ def handle_document_upload(db_conn):
 
 def _compute_response(context: str, prompt: str, cfg: dict) -> tuple[str, str]:
     """Pure computation — runs in background thread. No st.* calls."""
-    rag_agent = get_rag_agent()
+    rag_agent = get_rag_agent(cfg)
     
     # Format history
     history_str = ""

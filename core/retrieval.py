@@ -73,9 +73,6 @@ def process_pdf(file) -> List:
             loader = PyPDFLoader(tmp_file.name)
             documents = loader.load()
 
-            all_content = [doc.page_content for doc in documents]
-            st.session_state.all_docs_content = "\n\n".join(all_content)
-
             for doc in documents:
                 doc.metadata.update({
                     "source_type": "pdf",
@@ -113,11 +110,6 @@ def process_web(url: str) -> List:
                 "timestamp": datetime.now().isoformat()
             })
 
-            # Check if all_docs_content exists because maybe no PDF was processed
-            if 'all_docs_content' not in st.session_state:
-                st.session_state.all_docs_content = ""
-            st.session_state.all_docs_content += "\n\n" + "\n\n".join([d.page_content for d in documents])
-
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
         chunks = text_splitter.split_documents(documents)
         logger.info(f"Split web content into {len(chunks)} chunks")
@@ -128,10 +120,10 @@ def process_web(url: str) -> List:
         return []
 
 
-def get_or_create_vector_store(db, texts=None):
+def get_or_create_vector_store(db, texts=None, use_cloud=False, cloud_provider="", cloud_api_key=""):
     """Get existing or create new vector store."""
-    if getattr(st.session_state, 'use_cloud', False) and getattr(st.session_state, 'cloud_provider', '') == "OpenAI" and getattr(st.session_state, 'cloud_api_key', ''):
-        embeddings = OpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=st.session_state.cloud_api_key)
+    if use_cloud and cloud_provider == "OpenAI" and cloud_api_key:
+        embeddings = OpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=cloud_api_key)
         collection_name = "openai_rag_table"
     else:
         embeddings = OllamaEmbeddings()
@@ -237,7 +229,7 @@ def get_available_documents(_db) -> List[str]:
         logger.warning(f"Failed to fetch available documents from LanceDB registry: {e}")
     return []
 
-def execute_retrieval_pipeline(vector_store, query: str, threshold: float, selected_docs: List[str] | None, db_conn) -> tuple[str, list]:
+def execute_retrieval_pipeline(vector_store, query: str, threshold: float, selected_docs: List[str] | None, db_conn, cfg: dict | None = None) -> tuple[str, list]:
     context = ""
     docs = []
     
@@ -293,14 +285,13 @@ def execute_retrieval_pipeline(vector_store, query: str, threshold: float, selec
         if not docs:
             if db_conn is not None:
                 # Use selected or all available if none selected
-                target_docs = selected_docs if selected_docs is not None else getattr(st.session_state, 'processed_documents', [])
+                if selected_docs is not None:
+                    target_docs = selected_docs
+                else:
+                    target_docs = cfg.get('processed_documents', []) if cfg else []
                 raw_text = get_document_texts(db_conn, target_docs)
                 if raw_text:
-                    st.session_state.all_docs_content = raw_text
-                    
-            if 'all_docs_content' in st.session_state and st.session_state.all_docs_content:
-                # context = st.session_state.all_docs_content[:8000]
-                context = st.session_state.all_docs_content
+                    context = raw_text
 
         if docs:
             context = "\n\n".join([d.page_content for d in docs])
