@@ -80,9 +80,13 @@ def render_model_settings():
         st.sidebar.warning("⚠️ Ollama is not installed. Falling back to Cloud API.")
         ollama_models = []
     else:
-        ollama_models = get_ollama_models()
+        ollama_models = get_ollama_models(only_tools=True)
         if not ollama_models:
-            st.sidebar.warning("⚠️ Ollama is installed but not running or no models pulled. Falling back to Cloud API.")
+            st.sidebar.warning("⚠️ No tool-compatible local models found.")
+            st.sidebar.info("RAG and Memory features require models that support tool calling (e.g., `llama3.2`, `qwen2.5`, `mistral`). Use `ollama pull llama3.2` to add one.")
+            # Fallback to showing all models so the user isn't stuck with an empty list, 
+            # but they are warned it might not work.
+            ollama_models = get_ollama_models(only_tools=False)
 
     st.session_state.use_cloud = False
 
@@ -104,7 +108,7 @@ def render_model_settings():
             "Select Local Model",
             options=ollama_models,
             index=0,
-            help="These are the models currently pulled in your local Ollama."
+            help="Only models supporting Tool Calling (required for RAG/Memory) are shown here."
         )
         st.sidebar.info(f"Using **{st.session_state.model_version}** locally.")
 
