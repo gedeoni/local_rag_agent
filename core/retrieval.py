@@ -251,11 +251,19 @@ def execute_retrieval_pipeline(vector_store, query: str, threshold: float, selec
             if len(selected_docs) == 0:
                 logger.info("Content retrieval bypassed: No documents selected.")
                 return "", []
-            # Construct LanceDB SQL filter string
-            safe_docs = [d.replace("'", "''") for d in selected_docs]
-            in_list = ", ".join(f"'{d}'" for d in safe_docs)
-            filter_str = f"metadata.file_name IN ({in_list}) OR metadata.url IN ({in_list})"
-            search_kwargs["filter"] = filter_str
+            # Build filter clauses separately for file_name vs url to avoid DataFusion
+            # failing when a field (e.g. "url") doesn't exist in the schema for PDF tables.
+            pdf_docs = [d for d in selected_docs if not d.startswith("http")]
+            url_docs = [d for d in selected_docs if d.startswith("http")]
+            filter_parts = []
+            if pdf_docs:
+                safe_pdfs = ", ".join(f"'{d.replace(chr(39), chr(39)+chr(39))}'" for d in pdf_docs)
+                filter_parts.append(f"metadata.file_name IN ({safe_pdfs})")
+            if url_docs:
+                safe_urls = ", ".join(f"'{d.replace(chr(39), chr(39)+chr(39))}'" for d in url_docs)
+                filter_parts.append(f"metadata.url IN ({safe_urls})")
+            if filter_parts:
+                search_kwargs["filter"] = " OR ".join(filter_parts)
 
         retriever = vector_store.as_retriever(
             search_type="similarity_score_threshold",

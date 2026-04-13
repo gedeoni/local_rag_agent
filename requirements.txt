@@ -12,3 +12,4 @@ ddgs
 lxml
 dspy-ai
 langchain-openai
+mcp
