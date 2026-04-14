@@ -18,7 +18,8 @@ from agno.knowledge.embedder.ollama import OllamaEmbedder
 logger = logging.getLogger(__name__)
 
 # Constants
-COLLECTION_NAME = "deepseek_rag_table"
+DOCUMENTS_VECTOR_TABLE = "aura_farm_vectors"
+DOCUMENTS_REGISTRY_TABLE = "document_registry"
 LANCEDB_URI = os.path.abspath("./.lancedb")
 
 class OllamaEmbeddings(Embeddings):
@@ -65,7 +66,7 @@ def get_lancedb_connection():
         return None
 
 def process_pdf(file) -> List:
-    """Process PDF file."""
+    """Process PDF file by producing chunks of text"""
     try:
         logger.info(f"Processing PDF: {file.name}")
         with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
@@ -120,20 +121,20 @@ def process_web(url: str) -> List:
         return []
 
 
-def get_or_create_vector_store(db, texts=None, use_cloud=False, cloud_provider="", cloud_api_key=""):
+def get_or_create_vector_store(db, text_chunks: List[str] =None, use_cloud=False, cloud_provider="", cloud_api_key=""):
     """Get existing or create new vector store."""
     if use_cloud and cloud_provider == "OpenAI" and cloud_api_key:
         embeddings = OpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=cloud_api_key)
         collection_name = "openai_rag_table"
     else:
         embeddings = OllamaEmbeddings()
-        collection_name = COLLECTION_NAME
+        collection_name = DOCUMENTS_VECTOR_TABLE
         
     try:
-        if texts:
+        if text_chunks:
             # Generate deterministic IDs for chunks to avoid duplicating them upon re-upload
             ids = []
-            for doc in texts:
+            for doc in text_chunks:
                 # Use file name or URL as the root identifier
                 source_identifier = doc.metadata.get("file_name", doc.metadata.get("url", "unknown_source"))
                 # Hash the source and the strict content together
@@ -142,19 +143,19 @@ def get_or_create_vector_store(db, texts=None, use_cloud=False, cloud_provider="
             
             try:
                 # 1. Try to open the existing table and upsert chunks with matching IDs
-                logger.info(f"Adding {len(texts)} documents to existing table '{collection_name}'")
+                logger.info(f"Adding {len(text_chunks)} documents to existing table '{collection_name}'")
                 store = LanceDB(
                     connection=db,
                     embedding=embeddings,
                     table_name=collection_name
                 )
-                store.add_documents(texts, ids=ids)
+                store.add_documents(text_chunks, ids=ids)
                 return store
             except Exception as inner_e:
                 # 2. Table doesn't exist yet, we must initialize it for the first time
-                logger.info(f"Creating new table '{collection_name}' with {len(texts)} documents")
+                logger.info(f"Creating new table '{collection_name}' with {len(text_chunks)} documents")
                 return LanceDB.from_documents(
-                    texts,
+                    text_chunks,
                     embeddings,
                     connection=db,
                     table_name=collection_name,
@@ -169,7 +170,7 @@ def get_or_create_vector_store(db, texts=None, use_cloud=False, cloud_provider="
                 table_name=collection_name
             )
     except Exception as e:
-        if texts:
+        if text_chunks:
             logger.error(f"Vector store creation error: {str(e)}")
             st.error(f"🔴 Vector store creation error: {str(e)}")
         else:
@@ -182,10 +183,10 @@ def register_document(db, source: str, content: str = ""):
     safe_source = source.replace("'", "''")
     try:
         tables = db.table_names() if hasattr(db, 'table_names') else db.list_tables()
-        if "document_registry" not in tables:
-            db.create_table("document_registry", data=[{"source": source, "content": content}])
+        if DOCUMENTS_REGISTRY_TABLE not in tables:
+            db.create_table(DOCUMENTS_REGISTRY_TABLE, data=[{"source": source, "content": content}])
         else:
-            table = db.open_table("document_registry")
+            table = db.open_table(DOCUMENTS_REGISTRY_TABLE)
             # Convert filter string for Datafusion
             df = table.search().where(f"source = '{safe_source}'").to_pandas()
             if df.empty:
@@ -200,8 +201,8 @@ def get_document_texts(db, sources: List[str]) -> str:
         return ""
     try:
         tables = db.table_names() if hasattr(db, 'table_names') else db.list_tables()
-        if "document_registry" in tables:
-            table = db.open_table("document_registry")
+        if DOCUMENTS_REGISTRY_TABLE in tables:
+            table = db.open_table(DOCUMENTS_REGISTRY_TABLE)
             
             safe_sources = [s.replace("'", "''") for s in sources]
             in_list = ", ".join(f"'{s}'" for s in safe_sources)
@@ -212,7 +213,7 @@ def get_document_texts(db, sources: List[str]) -> str:
                 content_list = df["content"].dropna().tolist()
                 return "\n\n".join(content_list)
     except Exception as e:
-        logger.warning(f"Failed to fetch content from document_registry: {e}")
+        logger.warning(f"Failed to fetch content from {DOCUMENTS_REGISTRY_TABLE}: {e}")
     return ""
 
 @st.cache_data
@@ -220,8 +221,8 @@ def get_available_documents(_db) -> List[str]:
     """Retrieve distinct document names/urls stored in the database registry."""
     try:
         tables = _db.table_names() if hasattr(_db, 'table_names') else _db.list_tables()
-        if "document_registry" in tables:
-            table = _db.open_table("document_registry")
+        if DOCUMENTS_REGISTRY_TABLE in tables:
+            table = _db.open_table(DOCUMENTS_REGISTRY_TABLE)
             df = table.to_pandas()
             if not df.empty and "source" in df.columns:
                 return sorted(list(set(df["source"].tolist())))
@@ -237,6 +238,23 @@ def execute_retrieval_pipeline(vector_store, query: str, threshold: float, selec
         return context, docs
         
     try:
+        # Self-healing: Ensure the vector store table handle is actually open.
+        # This prevents the "'NoneType' object has no attribute 'search'" error.
+        if vector_store:
+            if hasattr(vector_store, "_table") and vector_store._table is None:
+                logger.info("Vector store table handle is lost. Attempting recovery.")
+                if db_conn is not None:
+                    try:
+                        table_name = getattr(vector_store, "_table_name", DOCUMENTS_VECTOR_TABLE)
+                        vector_store._table = db_conn.open_table(table_name)
+                        logger.info(f"Successfully recovered table handle for '{table_name}'")
+                    except Exception as re_e:
+                        logger.warning(f"Self-healing failed: {re_e}")
+                        # If recovery failed, we don't return context but continue to check for raw text fallback below
+        else:
+            logger.warning("No vector store provided to pipeline.")
+            return "", []
+        
         search_kwargs = {"k": 5, "score_threshold": threshold}
         
         if selected_docs is not None:

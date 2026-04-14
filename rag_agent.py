@@ -203,8 +203,8 @@ def optimize_search_query(prompt: str, cfg: dict | None = None) -> tuple[str, st
             # Use selected_docs as the source of truth — only inform the LLM
             # about the documents the user has actually chosen to query against.
             if cfg is not None:
-                selected = cfg.get('selected_docs')
-                active_docs = selected if selected is not None else cfg.get('processed_documents', [])
+                selected_docs = cfg.get('selected_docs')
+                active_docs = selected_docs if selected_docs is not None else cfg.get('processed_documents', [])
                 use_cloud = cfg.get('use_cloud', False)
                 cloud_provider = cfg.get('cloud_provider', '')
                 cloud_api_key = cfg.get('cloud_api_key', '')
@@ -216,6 +216,11 @@ def optimize_search_query(prompt: str, cfg: dict | None = None) -> tuple[str, st
                 cloud_provider = getattr(st.session_state, "cloud_provider", "")
                 cloud_api_key = getattr(st.session_state, "cloud_api_key", "")
                 model_version = st.session_state.model_version
+            
+            # Extract and format history (sliding window of 8)
+            history_list = cfg.get('history', []) if cfg else st.session_state.history
+            recent_history = history_list[-8:]
+            formatted_history = "\n".join([f"{m['role'].capitalize()}: {m['content']}" for m in recent_history])
 
             processed_document_info = "No documents have been selected for search."
             if active_docs:
@@ -236,7 +241,11 @@ def optimize_search_query(prompt: str, cfg: dict | None = None) -> tuple[str, st
 
             with dspy.context(lm=lm):
                 optimizer = QueryOptimizer()
-                result = optimizer(original_query=prompt, processed_document_info=processed_document_info)
+                result = optimizer(
+                    original_query=prompt, 
+                    processed_document_info=processed_document_info,
+                    history=formatted_history
+                )
                 # Clean the optimized query of reasoning artifacts
                 optimized_query = clean_reasoning_output(result.optimized_query)
                 optimized_info = f"✨ Optimized Search Query: {optimized_query}"
@@ -290,12 +299,12 @@ def retrieve_agent_context(query: str, cfg: dict | None = None) -> tuple[str, li
 
     return context, docs
 
-def _process_and_register_source(db_conn, source_id: str, texts: list):
+def _process_and_register_source(db_conn, source_id: str, text_chunks: list):
     """A generic helper to update state, vector store, and DB after processing text."""
-    if texts and db_conn is not None:
-        full_text = "\n\n".join([doc.page_content for doc in texts])
+    if text_chunks and db_conn is not None:
+        full_text = "\n\n".join([doc.page_content for doc in text_chunks])
         st.session_state.vector_store = get_or_create_vector_store(
-            db_conn, texts,
+            db_conn, text_chunks,
             use_cloud=st.session_state.get('use_cloud', False),
             cloud_provider=st.session_state.get('cloud_provider', ''),
             cloud_api_key=st.session_state.get('cloud_api_key', '')
@@ -312,12 +321,15 @@ def _process_and_register_source(db_conn, source_id: str, texts: list):
         return True
     return False
 
-def handle_document_upload(db_conn):
-    """Handles the sidebar logic for document uploads."""
+def render_data_upload():
+    """Renders the sidebar UI for document uploads and returns the user inputs."""
     st.sidebar.header("📁 Data Upload")
     uploaded_file = st.sidebar.file_uploader("Upload PDF", type=["pdf"])
     web_url = st.sidebar.text_input("Or enter URL")
+    return uploaded_file, web_url
 
+def process_uploaded_sources(db_conn, uploaded_file, web_url):
+    """Orchestrates the ingestion logic for new data sources and handles lazy init."""
     # Initialize vector store from existing DB if not yet in session
     if db_conn is not None and st.session_state.vector_store is None:
         st.session_state.vector_store = get_or_create_vector_store(
@@ -329,16 +341,18 @@ def handle_document_upload(db_conn):
 
     if uploaded_file and uploaded_file.name not in st.session_state.processed_documents:
         with st.spinner('Processing PDF...'):
-            texts = process_pdf(uploaded_file)
-            if _process_and_register_source(db_conn, uploaded_file.name, texts):
+            text_chunks = process_pdf(uploaded_file)
+            if _process_and_register_source(db_conn, uploaded_file.name, text_chunks):
                 st.success(f"✅ Added PDF: {uploaded_file.name}")
 
     if web_url and web_url not in st.session_state.processed_documents:
         with st.spinner('Processing URL...'):
-            texts = process_web(web_url)
-            if _process_and_register_source(db_conn, web_url, texts):
+            text_chunks = process_web(web_url)
+            if _process_and_register_source(db_conn, web_url, text_chunks):
                 st.success(f"✅ Added URL: {web_url}")
 
+def render_context_selection(db_conn):
+    """Renders the multiselect UI for filtering RAG context by source."""
     st.sidebar.header("📚 Context Selection")
     if db_conn is not None:
         available_docs = set(get_available_documents(db_conn))
@@ -410,8 +424,16 @@ def _snapshot_session_state() -> dict:
 
 def _run_pipeline(prompt: str, stop_event: threading.Event, cfg: dict):
     """Full query pipeline running in a background daemon thread.
-    Checks stop_event between stages. Writes result to session state.
-    Uses a pre-captured cfg snapshot instead of touching st.session_state directly.
+
+    This function orchestrates the end-to-end processing of a user query:
+    1. **Query Optimization**: Rephrases the prompt using DSPy for better retrieval accuracy.
+    2. **Context Retrieval**: Searches the vector store and/or invokes web search fallback.
+    3. **Response Computation**: Generates the final thinking process and answer via the RAG agent.
+    4. **State Management**: Updates session state with results or error status.
+    5. **Memory Archiving**: Asynchronously updates the long-term memory (Mempalace).
+
+    Checks the `stop_event` between stages to allow for safe cancellation. 
+    Uses a pre-captured `cfg` snapshot to ensure thread-safety when reading settings.
     """
     try:
         optimized_query, optimized_info = optimize_search_query(prompt, cfg)
@@ -468,8 +490,8 @@ def _trigger_memory_update(prompt: str, answer: str, cfg: dict):
         logger.error(f"Background memory supervisor failed: {e}")
 
 def main():
-    st.set_page_config(page_title="Deepseek Local RAG", layout="wide")
-    st.title("🐋 Local RAG Reasoning Agent")
+    st.set_page_config(page_title="Aura Farm RAG", layout="wide")
+    st.title("✨ Aura Farm RAG Reasoning Agent")
 
     init_session_state()
     render_sidebar()
@@ -485,7 +507,9 @@ def main():
     # Document Management
     if st.session_state.rag_enabled:
         db_conn = get_lancedb_connection()
-        handle_document_upload(db_conn)
+        uploaded_file, web_url = render_data_upload()
+        process_uploaded_sources(db_conn, uploaded_file, web_url)
+        render_context_selection(db_conn)
     elif not st.session_state.processed_documents:
         st.info("👋 Upload a document or enable RAG mode, or use the toggle to chat directly!")
 

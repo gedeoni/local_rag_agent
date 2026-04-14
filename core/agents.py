@@ -7,7 +7,10 @@ from agno.agent import Agent
 from agno.models.ollama import Ollama
 from agno.models.openai import OpenAIChat
 from agno.tools.duckduckgo import DuckDuckGoTools
+from agno.tools.wikipedia import WikipediaTools
+from agno.tools.website import WebsiteTools
 from agno.tools.mcp import MCPTools
+from datetime import datetime
 from mcp import StdioServerParameters
 import shutil
 
@@ -88,40 +91,49 @@ def _ensure_palace_initialized():
 class QuerySignature(dspy.Signature):
     """You are a search query optimizer for a RAG document retrieval system.
 
-    Your ONLY job is to rephrase queries that are vague about WHICH document they refer to,
-    using the 'processed_document_info' to make them explicit and specific.
+    Your ONLY job is to rephrase queries that are vague or implicit, using the 
+    'processed_document_info' and 'history' to make them explicit and specific for search.
+
+    HISTORY RELEVANCY RULE:
+    - Before using history, verify if the 'original_query' is a follow-up to previous messages.
+    - If 'original_query' is a new topic unrelated to the history (e.g. switching from 
+      nutrition to a file summary), IGNORE the history.
+    - ONLY use history to resolve pronouns (it, them, its) or vague entities (the document, the author).
 
     IMPORTANT RULES:
     - If the query is a general instruction, tool invocation, greeting, meta-command, or
-      anything NOT about retrieving content from the listed documents, return it EXACTLY
+      anything NOT about retrieving content from the listed documents, return it EXACTLY 
       as-is without any modification.
     - If the query already clearly names what it is looking for, return it as-is.
-    - Only modify the query when it contains vague references like 'this document',
-      'the uploaded file', 'it', 'the content', 'summarize this', etc.
-    - NEVER guess a document name from the examples. ONLY use the document names provided in 'processed_document_info'.
+    - NEVER guess a document name from the examples. ONLY use names from 'processed_document_info'.
 
     Examples of queries to return UNCHANGED:
       - "Use mempalace_status to check your memory"
-      - "What is the capital of France?"
-      - "Hello, how are you?"
       - "Search the web for recent AI news"
-      - "How about the food I should eat for muscle building?"
+      - "Hello, how are you?"
 
     Examples of queries to MODIFY (assuming 'Book.pdf' is the only processed document):
-      - "Summarize this document" → "Summarize the key findings in 'Book.pdf'"
-      - "What does it say about methodology?" → "What does 'Book.pdf' say about methodology?"
+      - History: [User: What is Book.pdf about? Assistant: It covers farming.] 
+        Query: "Summarize it" → "Summarize the key findings in 'Book.pdf'"
+      - History: [User: Tell me about 'Report.pdf'] 
+        Query: "Who wrote it?" → "Who is the author of 'Report.pdf'?"
     """
+    history = dspy.InputField(desc="Recent conversation history to resolve pronouns and implicit context.")
     original_query = dspy.InputField()
     processed_document_info = dspy.InputField(desc="Information about documents available for search. Only use this to resolve vague references.")
-    optimized_query = dspy.OutputField(desc="The original query returned unchanged if it is general/tool/meta, OR a rephrased query with explicit document names if vague document references were present.")
+    optimized_query = dspy.OutputField(desc="The original query returned unchanged if it is general/tool/meta, OR a rephrased query with explicit document names and resolved entities if context was used.")
 
 class QueryOptimizer(dspy.Module):
     def __init__(self):
         super().__init__()
         self.generate_query = dspy.ChainOfThought(QuerySignature)
 
-    def forward(self, original_query, processed_document_info):
-        return self.generate_query(original_query=original_query, processed_document_info=processed_document_info)
+    def forward(self, original_query, processed_document_info, history=""):
+        return self.generate_query(
+            original_query=original_query, 
+            processed_document_info=processed_document_info,
+            history=history
+        )
 
 def _get_model(cfg: dict):
     """Helper to return the correct model instance dynamically."""
@@ -133,22 +145,41 @@ def _get_model(cfg: dict):
         model_ver = cfg.get("model_version", "llama3.2:latest")
         return Ollama(id=model_ver)
 
+def get_current_datetime() -> str:
+    """Returns the current local date and time. 
+    Use this for any queries about 'today', 'now', 'yesterday', or 'tomorrow'.
+    """
+    now = datetime.now()
+    return f"The current local date and time is: {now.strftime('%A, %B %d, %Y, %H:%M:%S')}"
+
 def get_web_search_agent(cfg: dict) -> Agent:
-    """Initialize a web search agent."""
+    """Initialize an improved web search agent with scraping and context awareness."""
     return Agent(
         name="Web Search Agent",
         model=_get_model(cfg),
-        tools=[DuckDuckGoTools()],
-        instructions="""You are a web search expert. Your primary goal is to find and summarize information from the web that directly answers the user's query.
+        tools=[
+            DuckDuckGoTools(), 
+            WikipediaTools(), 
+            WebsiteTools(), 
+            get_current_datetime
+        ],
+        instructions="""You are a high-performance web research expert. Your goal is to provide comprehensive, factual, and up-to-date answers.
 
-        Follow these steps:
-        1. Use the DuckDuckGo search tools to gather relevant information.
-        2. Prefer 'search' or 'duckduckgo_search' for general facts and data.
-        3. Extract the most important and factual information pertinent to the user's question.
-        4. Synthesize this information into a concise and clear summary or a list of key findings.
-        5. Always include the URLs of the sources you used.
-        6. If a search tool returns no results, try rephrasing or using a general search before giving up.
-        7. If no relevant information can be found at all, explicitly state that you were unable to find an answer.
+        SEARCH & RETRIEVAL STRATEGY:
+        1.  **Temporal Awareness**: For any query mentioning 'today', 'tomorrow', 'now', or 'latest', ALWAYS start by calling `get_current_datetime` to establish fixed context.
+        2.  **Breadth First (Snippets)**: Use DuckDuckGo first. **CRITICAL**: For quick factual answers (weather, time, stock prices, population), the search results snippets are often sufficient. Read them carefully before decide to scrape a site.
+        3.  **Deep Dive (Scraping)**: Only use `website_read` if DuckDuckGo snippets are clearly insufficient or if you need a detailed report/long-form text.
+        4.  **Resilience & 403 Forbidden**: If you encounter a '403 Forbidden' error while reading a website (like AccuWeather or Weather.com), DO NOT GIVE UP. Instead:
+            - Use the information already available in the search snippets.
+            - Try a different reputable source from your search results.
+            - Try a more specific search query to get a direct answer block from the search engine.
+        5.  **Weather Queries**: Prefer using search snippets for the current temperature and conditions. If a deep dive is needed, try multiple weather providers if one blocks you.
+        6.  **Location Context**: If a user asks for local info (weather, time, events) without specifying a location, ALWAYS ask the user for their city/location before searching to ensure accuracy.
+
+        RESPONSE STYLE:
+        - Summarize facts clearly.
+        - Cite your sources with clickable URLs.
+        - If no information is found after trying multiple tool steps, explain clearly what you searched for and why it might be unavailable.
         """,
         markdown=True,
     )
@@ -246,7 +277,7 @@ async def _get_memory_agent_async(mcp_tools: MCPTools | None, cfg: dict) -> Agen
         If there are any new facts, decisions, context, or conclusions reached, you MUST call 'mempalace_diary_write' to save them.
         IMPORTANT: ALWAYS use the exact parameter names defined in the tool schema (e.g., use 'entry' NOT 'q').
         When calling 'mempalace_diary_write', you MUST use these exact parameters:
-        - agent_name: Set this to 'RAG_Agent'.
+        - agent_name: Set this to 'Aura_Farm_RAG_Agent'.
         - entry: Your summary or factoid in AAAK format.
         - topic: A relevant topic category (optional).
         Do NOT use a 'q' or 'query' parameter.
