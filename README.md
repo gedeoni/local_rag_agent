@@ -9,8 +9,8 @@ A state-of-the-art, privacy-focused Retrieval-Augmented Generation (RAG) system 
 *   **Asynchronous Processing**: Non-blocking query pipeline. A background thread handles optimization, retrieval, and generation while keeping the UI responsive.
 *   **Recursive Memory Archiving**: A secondary **Memory Saver Agent** listens to every interaction and asynchronously files important insights into the Memory Palace.
 *   **Hybrid Retrieval Engine**:
-    *   **Vector Search**: Precise semantic retrieval via **LanceDB**.
-    *   **Web Fallback**: Agentic web search using **DuckDuckGo** when local context is insufficient.
+    *   **Vector Search**: Precise semantic retrieval via **LanceDB** with built-in **Self-Healing handle recovery**.
+    *   **Resilient Web Search**: Multi-stage web searching using **DuckDuckGo**. Intelligent fallback that handles `403 Forbidden` errors by switching between sources and search snippets.
     *   **Raw Text Registry**: Last-resort full-text lookup to prevents "I don't know" responses.
 *   **DSPy Query Optimization**: Uses Chain-of-Thought reasoning to resolve vague references (e.g., "Summarize this pdf") into specific, document-aware search queries.
 
@@ -33,8 +33,11 @@ To prevent Streamlit UI "freezing" during complex reasoning/retrieval tasks:
 2.  **Thread Worker**: A daemon thread runs the full RAG cycle (Optimize → Retrieve → Compute → Save).
 3.  **UI Interleaving**: The main thread polls for results and renders components (Thinking process, Sources, etc.) as they become available.
 
-### 3. Reliability Layer (MCP Aliasing)
-To handle inconsistencies in different LLM models (especially smaller ones like Llama 3.2), the system includes a **Parameter Aliasing Layer** in the MCP server. If an agent stubbornly sends a parameter named `q` (common for search) instead of the required `query`, the server automatically re-maps it without crashing.
+### 3. Reliability & Self-Healing
+To ensure a robust user experience across different models and environments:
+-   **MCP Aliasing**: Handles inconsistencies in LLM tool calls. If a model sends a parameter named `q` instead of `query`, the server automatically re-maps it.
+-   **RAG Handle Recovery**: The retrieval pipeline automatically detects and repairs lost database handles, ensuring vector search remains active during long sessions.
+-   **Anti-Block Web Strategy**: The web agent avoids brittle scraping; it prioritizes search snippets and automatically switches providers if a site blocks the request (e.g., handles AccuWeather 403 errors).
 
 ---
 
