@@ -67,5 +67,16 @@ Not every question needs a document search. The system uses a **heuristic bypass
 
 ---
 
+## 👨‍💻 Author
+
+**Gedeon**
+* GitHub: [@gedeon](https://github.com/gedeoni/gedeoni)
+
+## 📄 License
+
+This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
+
+---
+
 > [!NOTE]
 > This project is designed for users who want total control over their data. It can run 100% air-gapped using local models, while providing the same "smart" memory features found in cloud-based AI services.
