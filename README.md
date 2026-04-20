@@ -1,4 +1,4 @@
-# 🐋 Local Dynamic RAG & Memory Agent
+# Aura Farm RAG Reasoning Agent
 
 A state-of-the-art, privacy-focused Retrieval-Augmented Generation (RAG) system built with Python, Streamlit, and the **Model Context Protocol (MCP)**. This agent provides a unified interface for document analysis, web search, and long-term semantic memory.
 
